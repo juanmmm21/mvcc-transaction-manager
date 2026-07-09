@@ -32,7 +32,7 @@ subproyecto hermano `lock-manager-deadlock-detector`, no de este.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from .models import (
     CommitSeq,
@@ -294,6 +294,83 @@ class MVCCTransactionManager:
         txn.status = TransactionStatus.ABORTED
         txn.write_buffer.clear()
         del self._transactions[txn.id]
+
+    # ------------------------------------------------------------------
+    # Recolección de basura
+    # ------------------------------------------------------------------
+
+    def gc(self) -> int:
+        """Poda versiones y estado de conflicto que ninguna transacción
+        activa puede ya necesitar.
+
+        El horizonte de poda es el mínimo `commit_horizon` entre todos los
+        snapshots activos (o `None`, tratado como "infinito", si no hay
+        ninguna transacción activa). Para cada fila, se conserva la versión
+        más reciente con `commit_seq <= horizonte` (la "versión suelo": es
+        la que vería cualquier transacción activa con el horizonte mínimo)
+        junto con todas las versiones posteriores al horizonte; el resto —
+        estrictamente más antiguo que la versión suelo — es inalcanzable
+        para siempre, así que se elimina. Si la versión suelo es además la
+        más reciente de la cadena y es un tombstone, la fila entera puede
+        olvidarse: nadie, ni ahora ni en el futuro, volverá a necesitar
+        saber que existió.
+
+        Por la misma razón (ningún snapshot activo tiene un horizonte
+        anterior al mínimo), también se descarta de la tabla de
+        transacciones el estado de conflicto de las transacciones ya
+        confirmadas con `commit_seq` anterior al horizonte: ninguna
+        transacción, activa ahora o futura, podrá considerarlas ya
+        concurrentes en `_check_serialization_conflicts`.
+
+        Devuelve el número de versiones de fila eliminadas.
+        """
+        with self._lock:
+            active = [
+                t for t in self._transactions.values() if t.status is TransactionStatus.ACTIVE
+            ]
+            horizon: CommitSeq | None = (
+                CommitSeq(min(t.snapshot.commit_horizon for t in active)) if active else None
+            )
+
+            pruned = 0
+            for row_id in list(self._store.row_ids()):
+                chain = sorted(self._store.versions_of(row_id), key=lambda v: v.commit_seq)
+                if not chain:
+                    continue
+                if horizon is None:
+                    floor_index = len(chain) - 1
+                else:
+                    floor_index = -1
+                    for index, version in enumerate(chain):
+                        if version.commit_seq <= horizon:
+                            floor_index = index
+                        else:
+                            break
+                    if floor_index == -1:
+                        continue  # todas las versiones son posteriores al horizonte: nada que podar
+                floor_version = chain[floor_index]
+                row_fully_obsolete = floor_version.value is None and floor_index == len(chain) - 1
+                keep: Sequence[RowVersion] = () if row_fully_obsolete else chain[floor_index:]
+                pruned += self._store.prune_versions(row_id, keep)
+
+            if horizon is None:
+                stale_txn_ids = [
+                    tid
+                    for tid, t in self._transactions.items()
+                    if t.status is TransactionStatus.COMMITTED
+                ]
+            else:
+                stale_txn_ids = [
+                    tid
+                    for tid, t in self._transactions.items()
+                    if t.status is TransactionStatus.COMMITTED
+                    and t.commit_seq is not None
+                    and t.commit_seq < horizon
+                ]
+            for tid in stale_txn_ids:
+                del self._transactions[tid]
+
+            return pruned
 
     # ------------------------------------------------------------------
     # Helpers internos
