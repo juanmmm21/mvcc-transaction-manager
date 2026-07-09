@@ -39,6 +39,7 @@ from .models import (
     IsolationLevel,
     RowId,
     RowVersion,
+    SerializationConflictError,
     Snapshot,
     Transaction,
     TransactionId,
@@ -173,13 +174,19 @@ class MVCCTransactionManager:
         transacción nunca llegó a ver. `READ_COMMITTED` no hace esta
         comprobación: como cada lectura suya ya usa el estado confirmado
         más reciente, no hay una noción de "dato obsoleto" que proteger.
+
+        En `SERIALIZABLE` además comprueba conflictos de serialización
+        (write skew) vía `_check_serialization_conflicts` antes de dar la
+        confirmación por buena.
         """
         with self._lock:
             txn = self._require_active(txn_id)
             try:
                 if txn.isolation_level is not IsolationLevel.READ_COMMITTED:
                     self._check_write_write_conflicts(txn)
-            except WriteConflictError:
+                if txn.isolation_level is IsolationLevel.SERIALIZABLE:
+                    self._check_serialization_conflicts(txn)
+            except (WriteConflictError, SerializationConflictError):
                 self._finalize_abort(txn)
                 raise
 
@@ -225,6 +232,63 @@ class MVCCTransactionManager:
                     f"(commit_seq={latest.commit_seq}) después del snapshot de {txn.id} "
                     f"(commit_horizon={txn.snapshot.commit_horizon})"
                 )
+
+    def _check_serialization_conflicts(self, txn: Transaction) -> None:
+        """Detecta y aborta transacciones "pivote" en modo `SERIALIZABLE`.
+
+        Implementa una versión simplificada de la regla de estructura
+        peligrosa de SSI (Cahill, Röhm y Fekete, 2008): si `txn` tiene, en
+        el momento de confirmar, tanto una rw-antidependencia *entrante*
+        (otra transacción concurrente ya confirmó una escritura sobre algo
+        que `txn` leyó) como una *saliente* (`txn` está a punto de escribir
+        algo que otra transacción concurrente ya leyó), entonces `txn` es
+        el vértice central de un posible ciclo de serialización de 2 o 3
+        transacciones y debe abortar — abortar al vértice central basta
+        para romper cualquier ciclo que pasase por él, sin necesidad de
+        reconstruir el grafo de dependencias completo.
+
+        El caso clásico de write skew (dos transacciones que leen las
+        mismas filas y escriben cada una en una fila distinta según lo
+        leído) es un ciclo de 2 transacciones: cuando la segunda en
+        confirmar comprueba su propio estado, ya tiene ambas
+        antidependencias marcadas y aborta.
+        """
+        # Entrante: ¿alguien que ya confirmó escribió algo que yo leí,
+        # habiendo confirmado después de que yo tomase mi snapshot?
+        for other in self._transactions.values():
+            if other.id == txn.id or other.status is not TransactionStatus.COMMITTED:
+                continue
+            assert other.commit_seq is not None
+            if other.commit_seq <= txn.snapshot.commit_horizon:
+                continue  # confirmó antes de que yo empezase: no es concurrente
+            if txn.read_set & other.write_set:
+                txn.has_conflict_in = True
+
+        # Saliente: ¿estoy a punto de escribir algo que otra transacción
+        # concurrente (activa, o confirmada después de que yo empezase) ya
+        # leyó? Si esa otra transacción sigue activa, marcamos también su
+        # `has_conflict_in` para que la detecte ella misma al confirmar,
+        # cubriendo así el ciclo de 2 transacciones sin depender del orden
+        # exacto en que ambas intenten confirmar.
+        for other in self._transactions.values():
+            if other.id == txn.id or other.status is TransactionStatus.ABORTED:
+                continue
+            is_concurrent = other.status is TransactionStatus.ACTIVE or (
+                other.commit_seq is not None and other.commit_seq > txn.snapshot.commit_horizon
+            )
+            if not is_concurrent:
+                continue
+            if txn.write_set & other.read_set:
+                txn.has_conflict_out = True
+                if other.status is TransactionStatus.ACTIVE:
+                    other.has_conflict_in = True
+
+        if txn.has_conflict_in and txn.has_conflict_out:
+            raise SerializationConflictError(
+                f"la transacción {txn.id} forma un ciclo de dependencias "
+                "read-write con otra transacción concurrente (write skew): "
+                "tiene tanto una rw-antidependencia entrante como saliente"
+            )
 
     def _finalize_abort(self, txn: Transaction) -> None:
         txn.status = TransactionStatus.ABORTED
