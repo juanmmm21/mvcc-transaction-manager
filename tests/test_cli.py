@@ -83,6 +83,17 @@ def test_repl_help_lists_available_commands(
     assert "commit <txn>" in output
 
 
+def test_benchmark_command_reports_throughput_per_level(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["benchmark", "--threads", "2", "--ops-per-thread", "5", "--keys", "3"]) == 0
+    output = capsys.readouterr().out
+    assert "read_committed" in output
+    assert "repeatable_read" in output
+    assert "serializable" in output
+    assert "tx/s" in output
+
+
 def test_unknown_command_exits_with_argparse_error() -> None:
     with pytest.raises(SystemExit):
         main(["not-a-real-command"])
