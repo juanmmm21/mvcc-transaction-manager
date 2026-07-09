@@ -6,10 +6,13 @@ Subcomandos:
             en memoria, las tres anomalías clásicas de concurrencia (dirty read,
             non-repeatable read, phantom read) en cada nivel de aislamiento y el
             aborto por write skew en modo serializable.
-    repl    intérprete interactivo de una sola sesión: permite abrir varias
-            transacciones a la vez (identificadas por su id numérico) y
-            entrelazar manualmente sus operaciones para explorar el
-            comportamiento de cada nivel de aislamiento.
+    repl        intérprete interactivo de una sola sesión: permite abrir varias
+                transacciones a la vez (identificadas por su id numérico) y
+                entrelazar manualmente sus operaciones para explorar el
+                comportamiento de cada nivel de aislamiento.
+    benchmark   mide throughput real bajo contención: varios hilos compiten por
+                incrementar filas de un keyspace pequeño, reintentando en el
+                cliente ante cualquier conflicto, para cada nivel de aislamiento.
 
 El `repl` es deliberadamente de un solo proceso y en memoria (no persiste
 entre invocaciones): a diferencia de un motor de storage con estado en
@@ -21,8 +24,11 @@ sesión.
 from __future__ import annotations
 
 import argparse
+import random
 import shlex
 import sys
+import threading
+import time
 
 from mvcc_transaction_manager.models import (
     IsolationLevel,
@@ -231,6 +237,81 @@ class _ReplSession:
     _cmd_exit = _cmd_quit
 
 
+def _benchmark_one_level(
+    level: IsolationLevel, num_threads: int, ops_per_thread: int, num_keys: int
+) -> None:
+    """Mide throughput sostenido con un hilo de `gc()` periódico en segundo
+    plano, como haría cualquier proceso de larga duración: sin él, la tabla
+    de estado de conflicto (`_transactions`) crece sin límite a lo largo de
+    la ejecución y la comprobación de `SERIALIZABLE` — que recorre todas las
+    transacciones confirmadas retenidas — degrada a O(n) por commit. Esto se
+    descubrió precisamente al correr este benchmark sin poda periódica; el
+    número que se reporta aquí ya refleja el throughput sostenible.
+    """
+    mgr = MVCCTransactionManager(InMemoryRowStore())
+    setup = mgr.begin()
+    for i in range(num_keys):
+        mgr.put(setup, RowId(f"key-{i}"), b"0")
+    mgr.commit(setup)
+
+    conflicts = 0
+    conflicts_lock = threading.Lock()
+    start_barrier = threading.Barrier(num_threads)
+    stop_gc = threading.Event()
+
+    def worker() -> None:
+        nonlocal conflicts
+        rng = random.Random()
+        start_barrier.wait()
+        for _ in range(ops_per_thread):
+            while True:
+                txn = mgr.begin(level)
+                row = RowId(f"key-{rng.randrange(num_keys)}")
+                current = mgr.get(txn, row)
+                next_value = int(current) + 1 if current is not None else 1
+                mgr.put(txn, row, str(next_value).encode())
+                try:
+                    mgr.commit(txn)
+                    break
+                except MvccError:
+                    with conflicts_lock:
+                        conflicts += 1
+
+    def gc_loop() -> None:
+        while not stop_gc.wait(timeout=0.005):
+            mgr.gc()
+
+    gc_thread = threading.Thread(target=gc_loop, daemon=True)
+    threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+    started_at = time.perf_counter()
+    gc_thread.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stop_gc.set()
+    gc_thread.join()
+    elapsed = time.perf_counter() - started_at
+
+    total_ops = num_threads * ops_per_thread
+    throughput = total_ops / elapsed if elapsed > 0 else float("inf")
+    retry_rate = conflicts / total_ops if total_ops else 0.0
+    print(
+        f"  {level.value:16s} committed={total_ops:5d} elapsed={elapsed:6.3f}s "
+        f"throughput={throughput:8.0f} tx/s conflicts={conflicts:4d} retry_rate={retry_rate:6.2%}"
+    )
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    print(
+        f"=== throughput bajo contención: {args.threads} hilos x {args.ops_per_thread} "
+        f"incrementos sobre {args.keys} filas compartidas ==="
+    )
+    for level in IsolationLevel:
+        _benchmark_one_level(level, args.threads, args.ops_per_thread, args.keys)
+    return 0
+
+
 def _cmd_repl(_: argparse.Namespace) -> int:
     session = _ReplSession()
     print("mvcc-transaction-manager repl -- 'help' para ver los comandos, 'quit' para salir")
@@ -245,12 +326,21 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("demo", help="reproduce las anomalías clásicas por nivel de aislamiento")
     subparsers.add_parser("repl", help="intérprete interactivo multi-transacción")
+
+    benchmark = subparsers.add_parser(
+        "benchmark", help="mide throughput bajo contención por nivel de aislamiento"
+    )
+    benchmark.add_argument("--threads", type=int, default=8)
+    benchmark.add_argument("--ops-per-thread", type=int, default=500)
+    benchmark.add_argument("--keys", type=int, default=8)
+
     return parser
 
 
 _HANDLERS = {
     "demo": _cmd_demo,
     "repl": _cmd_repl,
+    "benchmark": _cmd_benchmark,
 }
 
 
