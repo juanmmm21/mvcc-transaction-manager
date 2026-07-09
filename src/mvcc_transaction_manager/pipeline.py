@@ -250,8 +250,21 @@ class MVCCTransactionManager:
         El caso clásico de write skew (dos transacciones que leen las
         mismas filas y escriben cada una en una fila distinta según lo
         leído) es un ciclo de 2 transacciones: cuando la segunda en
-        confirmar comprueba su propio estado, ya tiene ambas
-        antidependencias marcadas y aborta.
+        confirmar hace su propia comprobación, su antidependencia entrante
+        viene de la primera (ya confirmada) y su saliente se detecta
+        porque la primera, aunque ya confirmada, sigue contando como
+        concurrente (confirmó después de que la segunda tomase su
+        snapshot) y había leído la fila que la segunda escribe.
+
+        Nótese que aquí sólo se *lee* el estado de otras transacciones,
+        nunca se muta: cada transacción calcula sus propios `has_conflict_in`/
+        `has_conflict_out` exclusivamente a partir de transacciones que ya
+        confirmaron (o siguen activas) en el momento de su propia
+        comprobación. Marcar proactivamente el `has_conflict_in` de otra
+        transacción todavía activa sería incorrecto — si esta transacción
+        (`txn`) acaba abortando por otro motivo, esa marca quedaría
+        huérfana en una transacción que nunca tuvo una antidependencia real
+        confirmada.
         """
         # Entrante: ¿alguien que ya confirmó escribió algo que yo leí,
         # habiendo confirmado después de que yo tomase mi snapshot?
@@ -265,11 +278,8 @@ class MVCCTransactionManager:
                 txn.has_conflict_in = True
 
         # Saliente: ¿estoy a punto de escribir algo que otra transacción
-        # concurrente (activa, o confirmada después de que yo empezase) ya
-        # leyó? Si esa otra transacción sigue activa, marcamos también su
-        # `has_conflict_in` para que la detecte ella misma al confirmar,
-        # cubriendo así el ciclo de 2 transacciones sin depender del orden
-        # exacto en que ambas intenten confirmar.
+        # concurrente (activa, o ya confirmada después de que yo empezase)
+        # ya leyó?
         for other in self._transactions.values():
             if other.id == txn.id or other.status is TransactionStatus.ABORTED:
                 continue
@@ -280,8 +290,6 @@ class MVCCTransactionManager:
                 continue
             if txn.write_set & other.read_set:
                 txn.has_conflict_out = True
-                if other.status is TransactionStatus.ACTIVE:
-                    other.has_conflict_in = True
 
         if txn.has_conflict_in and txn.has_conflict_out:
             raise SerializationConflictError(
