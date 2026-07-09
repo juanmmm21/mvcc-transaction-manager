@@ -44,6 +44,7 @@ from .models import (
     TransactionId,
     TransactionNotActiveError,
     TransactionStatus,
+    WriteConflictError,
 )
 from .protocols import RowStore
 
@@ -158,13 +159,30 @@ class MVCCTransactionManager:
             return results
 
     # ------------------------------------------------------------------
-    # Confirmación y aborto (fase inicial, sin detección de conflictos aún)
+    # Confirmación y aborto
     # ------------------------------------------------------------------
 
     def commit(self, txn_id: TransactionId) -> CommitSeq:
-        """Confirma una transacción, materializando su buffer en el storage."""
+        """Confirma una transacción, materializando su buffer en el storage.
+
+        En `REPEATABLE_READ` y `SERIALIZABLE` valida antes que ninguna otra
+        transacción haya confirmado, después de que ésta tomase su
+        snapshot, un cambio sobre alguna fila de su `write_set`
+        ('first committer wins'); si lo hizo, aborta con
+        `WriteConflictError` en vez de sobrescribir a ciegas datos que esta
+        transacción nunca llegó a ver. `READ_COMMITTED` no hace esta
+        comprobación: como cada lectura suya ya usa el estado confirmado
+        más reciente, no hay una noción de "dato obsoleto" que proteger.
+        """
         with self._lock:
             txn = self._require_active(txn_id)
+            try:
+                if txn.isolation_level is not IsolationLevel.READ_COMMITTED:
+                    self._check_write_write_conflicts(txn)
+            except WriteConflictError:
+                self._finalize_abort(txn)
+                raise
+
             new_seq = CommitSeq(self._last_committed_seq + 1)
             for row_id, value in txn.write_buffer.items():
                 self._store.append_version(
@@ -180,6 +198,33 @@ class MVCCTransactionManager:
         with self._lock:
             txn = self._require_active(txn_id)
             self._finalize_abort(txn)
+
+    def _check_write_write_conflicts(self, txn: Transaction) -> None:
+        """Lanza `WriteConflictError` si `txn` pisaría un cambio que no vio.
+
+        Para cada fila que `txn` quiere escribir, comprueba si la versión
+        más reciente ya confirmada tiene un `commit_seq` posterior al
+        horizonte del snapshot de `txn` — es decir, si alguien más
+        confirmó un cambio sobre esa fila *después* de que `txn` empezase.
+        Como el storage sólo contiene versiones ya confirmadas (nunca
+        material de una transacción todavía activa), esta comprobación no
+        necesita distinguir "confirmado" de "en curso": basta comparar
+        `commit_seq` contra el horizonte.
+        """
+        for row_id in txn.write_set:
+            chain = self._store.versions_of(row_id)
+            if not chain:
+                continue
+            latest = max(chain, key=lambda v: v.commit_seq)
+            if latest.created_by == txn.id:
+                continue
+            if latest.commit_seq > txn.snapshot.commit_horizon:
+                raise WriteConflictError(
+                    f"la transacción {txn.id} no puede confirmar: la fila {row_id!r} "
+                    f"fue modificada por la transacción {latest.created_by} "
+                    f"(commit_seq={latest.commit_seq}) después del snapshot de {txn.id} "
+                    f"(commit_horizon={txn.snapshot.commit_horizon})"
+                )
 
     def _finalize_abort(self, txn: Transaction) -> None:
         txn.status = TransactionStatus.ABORTED
