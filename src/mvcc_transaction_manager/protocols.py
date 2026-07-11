@@ -58,3 +58,27 @@ class RowStore(Protocol):
         versiones se eliminaron.
         """
         ...
+
+
+@runtime_checkable
+class BulkRowStore(RowStore, Protocol):
+    """Extensión opcional de `RowStore` para lecturas masivas.
+
+    Un backend que pueda recorrer todo su contenido en una única pasada
+    barata (un range scan en un B+Tree/LSM, una iteración de dict en
+    memoria) la expone aquí y `pipeline.MVCCTransactionManager.scan` la
+    detecta con `isinstance` para materializar el snapshot completo sin
+    hacer una llamada `versions_of` por fila — el coste que dominaba las
+    lecturas de `nanosql` sobre storage real. Es aditiva y opcional: un
+    `RowStore` sin este método sigue funcionando por el camino fila a fila.
+    """
+
+    def all_versions(self) -> Iterator[RowVersion]:
+        """Todas las versiones de todas las filas, en cualquier orden.
+
+        No exige orden global ni contigüidad por fila: el consumidor
+        acumula por `row_id`. La única garantía requerida es completitud
+        (exactamente las mismas versiones que expondrían `row_ids()` +
+        `versions_of`).
+        """
+        ...

@@ -35,6 +35,13 @@ class InMemoryRowStore:
     def versions_of(self, row_id: RowId) -> Sequence[RowVersion]:
         return tuple(self._chains.get(row_id, ()))
 
+    def all_versions(self) -> Iterator[RowVersion]:
+        # Implementa el protocolo opcional `BulkRowStore`. Copia de la lista
+        # de cadenas: el consumidor puede tardar en agotar el iterador y un
+        # dict no admite mutación durante la iteración.
+        for chain in list(self._chains.values()):
+            yield from chain
+
     def row_ids(self) -> Iterator[RowId]:
         return iter(list(self._chains.keys()))
 
