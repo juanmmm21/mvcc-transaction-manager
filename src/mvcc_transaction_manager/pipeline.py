@@ -47,17 +47,29 @@ from .models import (
     TransactionStatus,
     WriteConflictError,
 )
-from .protocols import RowStore
+from .protocols import BulkRowStore, RowStore
 
 
 class MVCCTransactionManager:
     """Gestor de transacciones MVCC sobre un `RowStore` pluggable."""
 
-    def __init__(self, store: RowStore) -> None:
+    def __init__(self, store: RowStore, *, last_committed_seq: int = 0) -> None:
+        """`last_committed_seq` siembra el contador monotónico de commits.
+
+        Necesario al reabrir un `RowStore` persistido de una sesión
+        anterior: las versiones ya materializadas llevan sus `commit_seq`
+        originales, y un contador que arrancase de nuevo en 0 las dejaría
+        todas por encima de cualquier horizonte nuevo (nada sería visible)
+        y reutilizaría seqs ya usados. El llamador pasa el `commit_seq`
+        máximo presente en el storage; con un storage vacío, el 0 por
+        defecto mantiene el comportamiento de siempre.
+        """
+        if last_committed_seq < 0:
+            raise ValueError(f"last_committed_seq debe ser >= 0, recibido {last_committed_seq}")
         self._store = store
         self._lock = threading.Lock()
         self._next_txn_id = 1
-        self._last_committed_seq = 0
+        self._last_committed_seq = int(last_committed_seq)
         self._transactions: dict[TransactionId, Transaction] = {}
 
     # ------------------------------------------------------------------
@@ -142,6 +154,8 @@ class MVCCTransactionManager:
         with self._lock:
             txn = self._require_active(txn_id)
             horizon = self._read_horizon(txn)
+            if row_ids is None and isinstance(self._store, BulkRowStore):
+                return self._scan_bulk(self._store, txn, horizon)
             candidates = (
                 set(row_ids)
                 if row_ids is not None
@@ -158,6 +172,35 @@ class MVCCTransactionManager:
                 if value is not None:
                     results.append((row_id, value))
             return results
+
+    def _scan_bulk(
+        self, store: BulkRowStore, txn: Transaction, horizon: CommitSeq
+    ) -> list[tuple[RowId, bytes]]:
+        """Camino rápido de `scan` para stores que implementan
+        `BulkRowStore`: una única pasada sobre todas las versiones en vez de
+        una llamada `versions_of` por fila. Semántica idéntica al camino
+        fila a fila — misma visibilidad, mismo orden, mismo `read_set`
+        (toda fila conocida cuenta como leída, visible o no: es lo que
+        protege de phantom reads a la detección de write skew)."""
+        newest: dict[RowId, RowVersion] = {}
+        known: set[RowId] = set(txn.write_buffer)
+        for version in store.all_versions():
+            known.add(version.row_id)
+            if version.commit_seq <= horizon:
+                current = newest.get(version.row_id)
+                if current is None or version.commit_seq > current.commit_seq:
+                    newest[version.row_id] = version
+        results: list[tuple[RowId, bytes]] = []
+        for row_id in sorted(known):
+            txn.read_set.add(row_id)
+            if row_id in txn.write_buffer:
+                value = txn.write_buffer[row_id]
+            else:
+                version_or_none = newest.get(row_id)
+                value = version_or_none.value if version_or_none is not None else None
+            if value is not None:
+                results.append((row_id, value))
+        return results
 
     # ------------------------------------------------------------------
     # Confirmación y aborto
