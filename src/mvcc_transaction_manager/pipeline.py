@@ -47,7 +47,7 @@ from .models import (
     TransactionStatus,
     WriteConflictError,
 )
-from .protocols import BulkRowStore, RowStore
+from .protocols import BulkRowStore, RangeRowStore, RowStore
 
 
 class MVCCTransactionManager:
@@ -173,8 +173,44 @@ class MVCCTransactionManager:
                     results.append((row_id, value))
             return results
 
+    def scan_range(
+        self, txn_id: TransactionId, start: RowId, end: RowId
+    ) -> list[tuple[RowId, bytes]]:
+        """Como `scan()` sin `row_ids`, pero sólo sobre las filas con
+        `start <= row_id < end`: mismo snapshot, misma visibilidad (incluidas
+        las escrituras propias sin confirmar del rango), mismo orden, y el
+        `read_set` registra las filas del rango — no las de fuera, que esta
+        lectura no ha observado. Con un store `RangeRowStore` cuesta lo que
+        el rango; con cualquier otro, recorre todo y filtra (mismo
+        resultado)."""
+        with self._lock:
+            txn = self._require_active(txn_id)
+            horizon = self._read_horizon(txn)
+            if isinstance(self._store, RangeRowStore):
+                versions = self._store.versions_in_range(start, end)
+            elif isinstance(self._store, BulkRowStore):
+                versions = (v for v in self._store.all_versions() if start <= v.row_id < end)
+            else:
+                versions = (
+                    version
+                    for row_id in self._store.row_ids()
+                    if start <= row_id < end
+                    for version in self._store.versions_of(row_id)
+                )
+            local = {r for r in txn.write_buffer if start <= r < end}
+            return self._materialize(versions, txn, horizon, local)
+
     def _scan_bulk(
         self, store: BulkRowStore, txn: Transaction, horizon: CommitSeq
+    ) -> list[tuple[RowId, bytes]]:
+        return self._materialize(store.all_versions(), txn, horizon, set(txn.write_buffer))
+
+    def _materialize(
+        self,
+        versions: Iterable[RowVersion],
+        txn: Transaction,
+        horizon: CommitSeq,
+        local_rows: set[RowId],
     ) -> list[tuple[RowId, bytes]]:
         """Camino rápido de `scan` para stores que implementan
         `BulkRowStore`: una única pasada sobre todas las versiones en vez de
@@ -183,8 +219,8 @@ class MVCCTransactionManager:
         (toda fila conocida cuenta como leída, visible o no: es lo que
         protege de phantom reads a la detección de write skew)."""
         newest: dict[RowId, RowVersion] = {}
-        known: set[RowId] = set(txn.write_buffer)
-        for version in store.all_versions():
+        known: set[RowId] = set(local_rows)
+        for version in versions:
             known.add(version.row_id)
             if version.commit_seq <= horizon:
                 current = newest.get(version.row_id)
