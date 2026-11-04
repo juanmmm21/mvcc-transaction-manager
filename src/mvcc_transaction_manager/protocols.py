@@ -82,3 +82,19 @@ class BulkRowStore(RowStore, Protocol):
         `versions_of`).
         """
         ...
+
+
+@runtime_checkable
+class RangeRowStore(RowStore, Protocol):
+    """Extensión opcional de `RowStore` para lecturas por rango de `row_id`.
+
+    `MVCCTransactionManager.scan_range` la usa para materializar sólo las
+    filas de un rango (p.ej. las de UNA tabla, cuando el `row_id` empieza
+    por el nombre de la tabla) en vez del almacén entero: el coste pasa de
+    ser lineal en el tamaño de la base de datos a serlo en el del rango.
+    """
+
+    def versions_in_range(self, start: RowId, end: RowId) -> Iterator[RowVersion]:
+        """Todas las versiones de las filas con `start <= row_id < end`
+        (orden lexicográfico de `row_id`), en cualquier orden."""
+        ...

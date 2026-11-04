@@ -23,13 +23,14 @@ from .models import (
     WriteConflictError,
 )
 from .pipeline import MVCCTransactionManager
-from .protocols import BulkRowStore, RowStore
+from .protocols import BulkRowStore, RangeRowStore, RowStore
 from .store import InMemoryRowStore
 
 __version__ = "0.1.0"
 
 __all__ = [
     "BulkRowStore",
+    "RangeRowStore",
     "CommitSeq",
     "InMemoryRowStore",
     "IsolationLevel",

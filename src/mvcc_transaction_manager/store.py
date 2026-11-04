@@ -42,6 +42,12 @@ class InMemoryRowStore:
         for chain in list(self._chains.values()):
             yield from chain
 
+    def versions_in_range(self, start: RowId, end: RowId) -> Iterator[RowVersion]:
+        # Implementa el protocolo opcional `RangeRowStore`.
+        for row_id, chain in list(self._chains.items()):
+            if start <= row_id < end:
+                yield from chain
+
     def row_ids(self) -> Iterator[RowId]:
         return iter(list(self._chains.keys()))
 
