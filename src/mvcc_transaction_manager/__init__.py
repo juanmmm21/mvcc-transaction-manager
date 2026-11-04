@@ -26,7 +26,7 @@ from .pipeline import MVCCTransactionManager
 from .protocols import BulkRowStore, RangeRowStore, RowStore
 from .store import InMemoryRowStore
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BulkRowStore",
